@@ -1,8 +1,9 @@
 # hdwig
 
 Genomic coverage tracks in HDF5. One file per track, one 1-D array per contig,
-float16 by default — the labels a sequence model trains against, stored so that
-whole-genome loads and random windows are both fast.
+float16 by default. It is an archival store — where a collection of tracks
+lives between the BigWigs it came from and whatever consumes it — so
+whole-genome loads are fast and random windows are fast too.
 
 Against the same seven tracks as BigWig, hdwig is 3.1x smaller and 2x faster to
 read a 128 kb window; against a gzip-compressed HDF5, 2.9x faster to load and 5x
