@@ -19,12 +19,9 @@ def _suffixed(path, exts):
 
 
 def _storage(args):
-    """The write options that were actually given; the rest keep their defaults,
-    or, converting one track to another, are inherited from the source."""
-    keys = ("units", "resolution", "headroom", "dtype", "chunk", "level", "shuffle")
-    opts = {k: getattr(args, k) for k in keys if getattr(args, k) is not None}
-    opts["compression"] = None if args.compression == "none" else args.compression
-    return opts
+    """Storage options, omitting unset metadata so it can be inherited."""
+    keys = ("units", "resolution", "headroom", "dtype", "chunk", "level", "shuffle", "compression")
+    return {k: getattr(args, k) for k in keys if getattr(args, k) is not None}
 
 
 def _convert(args):
@@ -78,7 +75,7 @@ def _info(args):
         print(f"  inf         {stats.inf}")
 
         if stats.max >= track.ceiling:
-            print(f"  SATURATED   values were clipped at {track.ceiling:g}; reconvert from the source")
+            print(f"  SATURATED   possible clipping at {track.ceiling:g}; check the source")
         elif stats.max > float(np.finfo("float16").max):
             print("  read with dtype='float32'; the true values exceed float16's range")
 

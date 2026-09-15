@@ -235,7 +235,7 @@ def test_from_track(tmp_path):
 
 def test_from_track_warns_when_clipped(tmp_path):
     old = _handmade(tmp_path / "clip.w5", {"chr1": np.array([1.0, F16MAX], "float16")})
-    with pytest.warns(UserWarning, match="clipped"):
+    with pytest.warns(UserWarning, match="may be clipped"):
         convert.from_track(old, tmp_path / "new.hw")
 
 
@@ -268,11 +268,13 @@ def test_merge_unions_contigs(tmp_path):
 ################################################################################
 # conversion
 ################################################################################
-pyBigWig = pytest.importorskip("pyBigWig")
+@pytest.fixture
+def pyBigWig():
+    return pytest.importorskip("pyBigWig")
 
 
 @pytest.fixture
-def bigwig(tmp_path):
+def bigwig(tmp_path, pyBigWig):
     path = str(tmp_path / "in.bw")
     bw = pyBigWig.open(path, "w")
     bw.addHeader([("chr1", 1000)])
@@ -305,7 +307,7 @@ def test_from_bigwig_options(tmp_path, bigwig):
         assert (track.read("chr1", dtype="float32") == 0.0).all()
 
 
-def test_bigwig_round_trip(tmp_path, bigwig):
+def test_bigwig_round_trip(tmp_path, bigwig, pyBigWig):
     hw, out = tmp_path / "t.hw", str(tmp_path / "out.bw")
     convert.from_bigwig([bigwig], hw)
     convert.to_bigwig(hw, out)
@@ -316,7 +318,7 @@ def test_bigwig_round_trip(tmp_path, bigwig):
         np.testing.assert_array_equal(x, track.read("chr1", dtype="float32"))
 
 
-def test_export_skips_nonfinite(tmp_path):
+def test_export_skips_nonfinite(tmp_path, pyBigWig):
     """A track holding nan exports without one interval per nan base; BigWig
     says "no data" by leaving the interval out, which reads back as nan."""
     hw, out = tmp_path / "t.hw", str(tmp_path / "out.bw")
@@ -348,7 +350,7 @@ def test_to_bedgraph(tmp_path):
     x[5:10] = 3.0
     hdwig.write(hw, {"chr1": x})
     convert.to_bedgraph(hw, bg)
-    assert bg.read_text() == "chr1\t5\t10\t3.0000\n"
+    assert bg.read_text() == "chr1\t5\t10\t3\n"
 
 
 ################################################################################
@@ -382,9 +384,119 @@ def test_cli_info_saturated(tmp_path, capsys):
     path = _handmade(tmp_path / "clip.w5", {"chr1": np.array([1.0, F16MAX], "float16")})
     cli.main(["info", str(path), "--scan"])
     out = capsys.readouterr().out
-    assert "legacy .w5" in out and "SATURATED" in out
+    assert "legacy .w5" in out and "possible clipping" in out
 
 
 def test_cli_bedgraph_needs_genome(tmp_path):
     with pytest.raises(SystemExit, match="genome"):
         cli.main(["convert", str(tmp_path / "x.bedgraph"), str(tmp_path / "y.hw")])
+
+
+@pytest.mark.parametrize("step", [0, 2, -1])
+def test_slicing_rejects_steps(tmp_path, step):
+    path = tmp_path / "t.hw"
+    hdwig.write(path, {"c": np.arange(4, dtype="float32")})
+    with hdwig.open(path) as track:
+        with pytest.raises(ValueError, match="slice step"):
+            track["c", ::step]
+        np.testing.assert_array_equal(track["c", ::1], track.read("c"))
+
+
+@pytest.mark.parametrize("values,expected", [
+    ([1, np.inf, -np.inf], [1, np.inf, -np.inf]),
+    ([np.nan, np.nan], [0, 0]),
+    ([np.nan, 1, np.nan, 3, np.nan], [1, 1, 2, 3, 3]),
+    ([np.inf, 1, np.nan, 3, -np.inf], [np.inf, 1, 2, 3, -np.inf]),
+])
+def test_interpolate_nan(values, expected):
+    np.testing.assert_array_equal(convert._interp_nan(np.array(values, "float32")), expected)
+
+
+@pytest.mark.parametrize("case,message", [
+    ("empty", "at least one"),
+    ("length", "lengths must match"),
+    ("resolution", "resolutions must match"),
+    ("override", "output resolution"),
+    ("units", "units differ"),
+])
+def test_merge_rejects_incompatible_inputs_before_writing(tmp_path, case, message):
+    a, b, out = (tmp_path / name for name in ("a.hw", "b.hw", "out.hw"))
+    hdwig.write(a, {"c": np.ones(4)}, resolution=10, units="reads")
+    hdwig.write(b, {"c": np.ones(1 if case == "length" else 4)},
+                resolution=1 if case == "resolution" else 10,
+                units="other" if case == "units" else "reads")
+    out.write_bytes(b"existing output")
+    kwargs = {"resolution": 1} if case == "override" else {}
+    with pytest.raises(ValueError, match=message):
+        hdwig.merge(out, [] if case == "empty" else [a, b], **kwargs)
+    assert out.read_bytes() == b"existing output"
+
+
+def test_merge_metadata(tmp_path):
+    a, b, out = (tmp_path / name for name in ("a.hw", "b.hw", "out.hw"))
+    hdwig.write(a, {"c": np.ones(4)}, resolution=10, units="reads")
+    hdwig.merge(out, [a, a])
+    with hdwig.open(out) as track:
+        assert (track.resolution, track.units) == (10, "reads")
+    hdwig.write(b, {"c": np.ones(4)}, resolution=10, units="other")
+    hdwig.merge(out, [a, b], units="combined", resolution=10)
+    with hdwig.open(out) as track:
+        assert (track.resolution, track.units) == (10, "combined")
+
+
+def test_merge_closes_inputs_on_open_failure(tmp_path, monkeypatch):
+    path, out = tmp_path / "a.hw", tmp_path / "out.hw"
+    hdwig.write(path, {"c": np.ones(4)})
+    track = hdwig.open(path)
+
+    def fail_second(path, **kwargs):
+        if path == "missing":
+            raise OSError("cannot open")
+        return track
+
+    monkeypatch.setattr(hdwig, "open", fail_second)
+    with pytest.raises(OSError, match="cannot open"):
+        hdwig.merge(out, [path, "missing"])
+    assert not track.h5.id.valid
+    assert not out.exists()
+
+
+def test_bigwig_closes_inputs_on_open_failure(tmp_path, bigwig, pyBigWig, monkeypatch):
+    from unittest.mock import Mock
+
+    bw = pyBigWig.open(bigwig)
+    handle = Mock(wraps=bw)
+    monkeypatch.setattr(pyBigWig, "open", Mock(side_effect=[handle, OSError("cannot open")]))
+    out = tmp_path / "out.hw"
+    with pytest.raises(OSError, match="cannot open"):
+        convert.from_bigwig([bigwig, "missing"], out)
+    handle.close.assert_called_once_with()
+    assert not out.exists()
+
+
+def test_bedgraph_export_precision_and_resolution(tmp_path):
+    path, out = tmp_path / "a.hw", tmp_path / "out.bg"
+    x = np.array([0, 1e-7, 1.2345678, np.nan, np.inf], "float32")
+    hdwig.write(path, {"c": x}, dtype="float32", resolution=10)
+    convert.to_bedgraph(path, out)
+    rows = [line.split() for line in out.read_text().splitlines()]
+    assert [row[:3] for row in rows] == [["c", "10", "20"], ["c", "20", "30"]]
+    np.testing.assert_array_equal(np.array([row[3] for row in rows], "float32"), x[1:3])
+
+
+def test_bigwig_export_resolution(tmp_path, pyBigWig):
+    path, out = tmp_path / "a.hw", tmp_path / "out.bw"
+    hdwig.write(path, {"c": np.array([0, 2, 2, 0], "float32")}, resolution=10)
+    convert.to_bigwig(path, out)
+    with pyBigWig.open(str(out)) as bw:
+        assert bw.chroms() == {"c": 40}
+        assert bw.intervals("c") == ((10, 30, 2.0),)
+
+
+def test_cli_merge_metadata_and_no_compression(tmp_path):
+    path, out = tmp_path / "a.hw", tmp_path / "out.hw"
+    hdwig.write(path, {"c": np.ones(4)}, resolution=10, units="reads")
+    cli.main(["merge", str(out), str(path), "--compression", "none"])
+    with hdwig.open(out) as track:
+        assert (track.resolution, track.units) == (10, "reads")
+        assert track.h5["c"].id.get_create_plist().get_nfilters() == 0

@@ -6,6 +6,7 @@ back out, so callers only ever see true values.
 """
 
 import warnings
+from contextlib import ExitStack
 from typing import NamedTuple
 
 import h5py
@@ -69,7 +70,8 @@ def scale_for(vmax, headroom=HEADROOM, dtype="float16"):
 
     Chosen to leave `headroom`x room under the dtype's ceiling, so that a later
     merge, or a higher peak in data not yet seen, still fits. A power of two
-    makes the read-time divide exact. Only float16 needs one.
+    makes the read-time divide exact within the output dtype's normal range.
+    Only float16 needs one.
     """
     dtype = np.dtype(dtype)
     if dtype != np.float16 or not np.isfinite(vmax) or vmax <= 0:
@@ -144,12 +146,13 @@ class Track:
 
     @property
     def ceiling(self):
-        """The largest true value this file can hold. Data reaching it was
-        clipped when the file was written, i.e. the scale was too small."""
+        """The largest true value this file can hold; reaching it may indicate clipping."""
         return float(np.finfo(self.stored_dtype).max) / self.scale
 
     def __getitem__(self, key):
         contig, window = key if isinstance(key, tuple) else (key, slice(None))
+        if window.step not in (None, 1):
+            raise ValueError("slice step must be 1")
         return self.read(contig, window.start, window.stop)
 
     def __contains__(self, contig):
@@ -265,15 +268,30 @@ STATS = {
 def merge(path, inputs, stat="sum", **kwargs):
     """Combine tracks base by base in true values, contigs unioned.
 
+    Inputs must agree on resolution and shared contig lengths. Common units
+    and resolution are inherited; differing units require an explicit override.
     Every statistic is monotone in each input, so applying it to the inputs'
     maxima bounds the output's -- enough to pick the scale and stream.
     """
-    tracks = [open(p, dtype="float32") for p in inputs]
-    try:
+    with ExitStack() as stack:
+        tracks = [stack.enter_context(open(p, dtype="float32")) for p in inputs]
+        if not tracks:
+            raise ValueError("merge requires at least one input")
+        resolution = tracks[0].resolution
+        if any(t.resolution != resolution for t in tracks):
+            raise ValueError("input resolutions must match")
+        if kwargs.setdefault("resolution", resolution) != resolution:
+            raise ValueError("output resolution must match input resolution")
+        if "units" not in kwargs:
+            if any(t.units != tracks[0].units for t in tracks):
+                raise ValueError("input units differ; pass units explicitly")
+            kwargs["units"] = tracks[0].units
+
         contigs = {}
         for track in tracks:
             for contig, length in track.contigs.items():
-                contigs.setdefault(contig, length)
+                if contigs.setdefault(contig, length) != length:
+                    raise ValueError(f"{contig}: input contig lengths must match")
 
         maxes = np.array([[t.max if t.max is not None else t.measure().max] for t in tracks], "float32")
         kwargs.setdefault("vmax", float(STATS[stat](maxes)[0]))
@@ -285,10 +303,7 @@ def merge(path, inputs, stat="sum", **kwargs):
                     if contig in track.contigs:
                         stacked[i] = track.read(contig)
                     else:
-                        warnings.warn(f"{inputs[i]} is missing {contig}", stacklevel=2)
+                        warnings.warn(f"{track.path} is missing {contig}", stacklevel=2)
                 yield contig, STATS[stat](stacked)
 
         write(path, summarized(), **kwargs)
-    finally:
-        for track in tracks:
-            track.close()

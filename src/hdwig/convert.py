@@ -2,6 +2,7 @@
 
 import gzip
 import warnings
+from contextlib import ExitStack
 
 import numpy as np
 
@@ -15,8 +16,10 @@ def _open_text(path):
 def _interp_nan(x):
     """Fill NaN by linear interpolation, clamped at the ends."""
     nan = np.isnan(x)
-    if nan.all() or not nan.any():
-        return np.nan_to_num(x)
+    if not nan.any():
+        return x
+    if nan.all():
+        return np.zeros_like(x)
     known = np.flatnonzero(~nan)
     x[nan] = np.interp(np.flatnonzero(nan), known, x[known])
     return x
@@ -48,8 +51,12 @@ def from_bigwig(inputs, path, multiply=1.0, clip_neg=False, interp_nan=False, **
     """
     import pyBigWig
 
-    bws = [pyBigWig.open(str(f)) for f in inputs]
-    try:
+    with ExitStack() as stack:
+        bws = []
+        for f in inputs:
+            bw = pyBigWig.open(str(f))
+            stack.callback(bw.close)
+            bws.append(bw)
         lengths = bws[0].chroms()
         for bw, name in zip(bws[1:], inputs[1:]):
             missing = set(lengths) - set(bw.chroms())
@@ -71,9 +78,6 @@ def from_bigwig(inputs, path, multiply=1.0, clip_neg=False, interp_nan=False, **
                 yield contig, x
 
         hdwig.write(path, contigs(), **kwargs)
-    finally:
-        for bw in bws:
-            bw.close()
 
 
 def from_bedgraph(bedgraph, genome, path, **kwargs):
@@ -108,14 +112,13 @@ def from_bedgraph(bedgraph, genome, path, **kwargs):
 def from_track(input, path, **kwargs):
     """Rewrite a track, most usefully a legacy `.w5`, under the current spec.
 
-    True values are preserved exactly; what changes is the scale, the codec and
-    the chunking. Clipping already in the source cannot be undone here -- that
-    needs the original BigWig -- so it is reported instead.
+    Reads true values and writes them with the requested storage precision.
+    Values at the source ceiling trigger a warning about possible clipping.
     """
     with hdwig.open(input, dtype="float32") as track:
         vmax = track.measure().max
         if vmax >= track.ceiling:
-            warnings.warn(f"{input} is clipped at {track.ceiling:g}; reconvert from its source")
+            warnings.warn(f"{input} may be clipped at {track.ceiling:g}; check its source")
         kwargs.setdefault("vmax", vmax)
         kwargs.setdefault("units", track.units)
         kwargs.setdefault("resolution", track.resolution)
@@ -133,15 +136,15 @@ def to_bigwig(path, out, contigs=None):
         contigs = contigs or list(track.contigs)
         bw = pyBigWig.open(str(out), "w")
         try:
-            bw.addHeader([(c, track.contigs[c]) for c in contigs])
+            bw.addHeader([(c, track.contigs[c] * track.resolution) for c in contigs])
             for contig in contigs:
                 starts, ends, values = _runs(track.read(contig))
                 keep = _interval(values)
                 if keep.any():
                     bw.addEntries(
                         [contig] * int(keep.sum()),
-                        starts[keep].tolist(),
-                        ends=ends[keep].tolist(),
+                        (starts[keep] * track.resolution).tolist(),
+                        ends=(ends[keep] * track.resolution).tolist(),
                         values=values[keep].tolist(),
                     )
         finally:
@@ -155,4 +158,4 @@ def to_bedgraph(path, out, contigs=None):
             starts, ends, values = _runs(track.read(contig))
             keep = _interval(values)
             for start, end, value in zip(*[a[keep] for a in (starts, ends, values)]):
-                print(f"{contig}\t{start}\t{end}\t{value:.4f}", file=bg)
+                print(f"{contig}\t{start * track.resolution}\t{end * track.resolution}\t{value:.9g}", file=bg)
