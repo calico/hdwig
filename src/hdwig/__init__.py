@@ -18,6 +18,7 @@ __version__ = "0.1.0"
 FORMAT = 1  # value of the `hdwig` root attribute
 EXT = ".hw"
 CHUNK = 2**16
+BLOCK = 2**22  # values handled at a time when writing
 HEADROOM = 4
 
 __all__ = ["Track", "Stats", "open", "write", "merge", "scale_for", "EXT", "FORMAT", "STATS"]
@@ -48,18 +49,22 @@ class Stats(NamedTuple):
 
 
 def _stats(x):
-    """Summarize one contig without copying it; these arrays reach a gigabyte."""
-    x = np.asarray(x, dtype="float32")
-    finite = np.isfinite(x)
-    nan = int(np.isnan(x).sum())
-    return Stats(
-        max=max(float(np.max(x, where=finite, initial=0.0)),
-                -float(np.min(x, where=finite, initial=0.0))),
-        sum=float(np.sum(x, where=finite, dtype="float64")),
-        nonzero=int(np.count_nonzero(finite & (x != 0))),
-        nan=nan,
-        inf=len(x) - int(finite.sum()) - nan,
-    )
+    """Summarize one contig. In blocks, so the masks it needs stay small: whole
+    contig temporaries reach a gigabyte and cost more than the arithmetic."""
+    total = Stats()
+    for i in range(0, len(x), BLOCK):
+        b = np.asarray(x[i : i + BLOCK], dtype="float32")
+        finite = np.isfinite(b)
+        nan = int(np.isnan(b).sum())
+        total += Stats(
+            max=max(float(np.max(b, where=finite, initial=0.0)),
+                    -float(np.min(b, where=finite, initial=0.0))),
+            sum=float(np.sum(b, where=finite, dtype="float64")),
+            nonzero=int(np.count_nonzero(finite & (b != 0))),
+            nan=nan,
+            inf=len(b) - int(finite.sum()) - nan,
+        )
+    return total
 
 
 ################################################################################
@@ -101,6 +106,7 @@ class Track:
         self.units = str(attrs.get("units", ""))
         self.max = float(attrs["max"]) if "max" in attrs else None
         self.contigs = {name: dset.shape[0] for name, dset in self.h5.items()}
+        self._unscaled = {}  # output dtype -> true value of every float16 bit pattern
         # legacy .w5 records none of this; `measure()` gets it by reading
         self.stats = Stats(
             self.max, float(attrs["sum"]), int(attrs["nonzero"]),
@@ -130,7 +136,16 @@ class Track:
         dtype = self.dtype if dtype is None else np.dtype(dtype)
         if self.scale == 1:
             return x.astype(dtype, copy=False)
-        return np.divide(x, self.scale, dtype=dtype)
+        if x.dtype != np.float16:
+            return np.divide(x, self.scale, dtype=dtype)
+        # float16 arithmetic runs in software, several times slower than the
+        # decode. A float16 has only 65,536 bit patterns, so divide each once
+        # and look the rest up.
+        if dtype not in self._unscaled:
+            every = np.arange(2**16, dtype="uint16").view("float16")
+            with np.errstate(all="ignore"):  # the table covers values the data may never hold
+                self._unscaled[dtype] = np.divide(every, self.scale, dtype=dtype)
+        return self._unscaled[dtype][x.view("uint16")]
 
     def load(self, contig, dtype=None):
         """True values over the whole contig."""
@@ -212,9 +227,11 @@ def write(
     An overstated `vmax` only costs headroom, an understated one raises.
     """
     items = arrays.items() if hasattr(arrays, "items") else arrays
+    measured = {}
     if vmax is None:
         arrays = dict(items)
-        vmax = max((_stats(x).max for x in arrays.values()), default=0.0)
+        measured = {contig: _stats(x) for contig, x in arrays.items()}
+        vmax = max((stats.max for stats in measured.values()), default=0.0)
         items = arrays.items()
 
     scale = scale_for(vmax, headroom, dtype)
@@ -230,8 +247,7 @@ def write(
         h5.attrs["units"] = units
 
         for contig, x in items:
-            x = np.array(x, dtype="float32")
-            stats = _stats(x)
+            stats = measured.get(contig) or _stats(x)
             total += stats
             # checked before scaling, so a value the scale sends to inf cannot
             # slip past as one more non-finite
@@ -243,11 +259,12 @@ def write(
             # nan and inf pass through. nan means "no data", which is not zero and
             # is the caller's to interpret; inf is corruption, but inventing a
             # finite value for it would hide that. Neither reaches the scale.
-            if scale != 1:
-                x *= scale
-            h5.create_dataset(
-                contig, data=x.astype(dtype), chunks=(max(1, min(chunk, len(x))),), **opts
+            dset = h5.create_dataset(
+                contig, shape=(len(x),), dtype=dtype, chunks=(max(1, min(chunk, len(x))),), **opts
             )
+            for i in range(0, len(x), BLOCK):
+                b = np.asarray(x[i : i + BLOCK], dtype="float32")
+                dset[i : i + BLOCK] = (b * np.float32(scale)).astype(dtype)
 
         # measured, not inferred from the vmax the scale came from
         for field, value in total._asdict().items():
