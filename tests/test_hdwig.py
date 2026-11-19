@@ -1,3 +1,5 @@
+import weakref
+
 import h5py
 import numpy as np
 import pytest
@@ -536,6 +538,53 @@ def test_memory_track_reads_after_file_closes(tmp_path, arrays):
     with hdwig.open(tmp_path / "a.hw", memory=True) as track:
         assert not track.h5.id.valid
         np.testing.assert_allclose(track["chr1", 10:20], arrays["chr1"][10:20], rtol=1e-3)
+        cached = weakref.ref(track._cache["chr1"])
+    assert cached() is None
+    with pytest.raises((KeyError, ValueError)):
+        track.read("chr1", 0, 1)
+
+
+def test_memory_reads_are_independent(tmp_path):
+    path = tmp_path / "a.hw"
+    hdwig.write(path, {"c": [1, 2]}, dtype="float32")
+    with hdwig.open(path, memory=True) as track:
+        track.bins("c")[0] = 5
+        track["c", 0:1][0] = 6
+        track.load("c")[0] = 7
+        np.testing.assert_array_equal(track.load("c"), [1, 2])
+
+
+def test_unsigned_window_coordinates(tmp_path):
+    path = tmp_path / "a.hw"
+    hdwig.write(path, {"c": np.arange(26)}, resolution=10)
+    with hdwig.open(path) as track:
+        np.testing.assert_array_equal(track["c", np.uint8(249):np.uint8(255)], [24, 25, 25, 25, 25, 25])
+
+
+def test_short_reads_from_large_bins(tmp_path):
+    path = tmp_path / "a.hw"
+    # A whole bin cannot fit in an ndarray, but these windows fit.
+    r = 2**63
+    hdwig.write(path, {"c": [3, 5]}, resolution=r)
+    with hdwig.open(path) as track:
+        np.testing.assert_array_equal(track.read("c", 1, 1), [])
+        np.testing.assert_array_equal(track.read("c", 2, 3), [3])
+        np.testing.assert_array_equal(track.read("c", r - 1, r + 1), [3, 5])
+
+
+@pytest.mark.parametrize("resolution", [0, -1])
+def test_invalid_resolution(tmp_path, resolution):
+    path = tmp_path / "a.hw"
+    hdwig.write(path, {"c": [1]})
+    with pytest.raises(ValueError, match="resolution"):
+        hdwig.write(path, {"c": [2]}, resolution=resolution)
+    with hdwig.open(path) as track:
+        np.testing.assert_array_equal(track.load("c"), [1])
+
+    with h5py.File(path, "r+") as h5:
+        h5.attrs["resolution"] = resolution
+    with pytest.raises(ValueError, match="resolution"):
+        hdwig.open(path)
 
 
 def test_coarse_merge_and_rewrite_keep_bins(tmp_path):

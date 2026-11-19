@@ -8,6 +8,7 @@ pairs; a track stored at coarser `resolution` repeats each value over its bp.
 
 import warnings
 from contextlib import ExitStack
+from operator import index
 from typing import NamedTuple
 
 import h5py
@@ -84,6 +85,13 @@ def scale_for(vmax, headroom=HEADROOM, dtype="float16"):
 ################################################################################
 # read
 ################################################################################
+def _positive_resolution(value):
+    resolution = int(value)
+    if resolution < 1:
+        raise ValueError(f"resolution must be positive, got {value!r}")
+    return resolution
+
+
 class Track:
     """A coverage track, open for reading.
 
@@ -102,7 +110,11 @@ class Track:
         attrs = self.h5.attrs
         self.format = int(attrs.get("hdwig", 0))  # 0: legacy .w5
         self.scale = float(attrs.get("scale", attrs.get("w5_scale", 1.0)))
-        self.resolution = int(attrs.get("resolution", 1))
+        try:
+            self.resolution = _positive_resolution(attrs.get("resolution", 1))
+        except (TypeError, ValueError, OverflowError):
+            self.h5.close()
+            raise
         self.units = str(attrs.get("units", ""))
         self.max = float(attrs["max"]) if "max" in attrs else None
         # bp, rounded up to whole bins
@@ -131,17 +143,18 @@ class Track:
                 self.dtype = np.dtype("float32")
 
         # stored values, from the file or held in memory for many random reads
-        self.data = self.h5
+        self._cache = None
         if memory:
-            self.data = {name: dset[:] for name, dset in self.h5.items()}
+            self._cache = {name: dset[:] for name, dset in self.h5.items()}
             self.h5.close()
 
     def bins(self, contig, start=None, end=None, dtype=None):
         """True stored values over bins `start:end` of `contig`."""
-        x = self.data[contig][start:end]
+        source = self.h5 if self._cache is None else self._cache
+        x = source[contig][start:end]
         dtype = self.dtype if dtype is None else np.dtype(dtype)
         if self.scale == 1:
-            return x.astype(dtype, copy=False)
+            return x.astype(dtype, copy=self._cache is not None)
         return np.divide(x, self.scale, dtype=dtype)
 
     def read(self, contig, start=None, end=None, dtype=None):
@@ -151,15 +164,24 @@ class Track:
         no data to return, and padding or truncating would hide that.
         """
         length = self.contigs[contig]
-        start = 0 if start is None else start
-        end = length if end is None else end
+        start = 0 if start is None else index(start)
+        end = length if end is None else index(end)
         if not 0 <= start <= end <= length:
             raise IndexError(f"{contig}:{start}-{end} is outside {contig}:0-{length}")
         r = self.resolution
         if r == 1:
             return self.bins(contig, start, end, dtype)
-        x = self.bins(contig, start // r, -(-end // r), dtype)
-        return np.repeat(x, r)[start % r : start % r + end - start]
+        first = start // r
+        if start == end:
+            return self.bins(contig, first, first, dtype)
+        x = self.bins(contig, first, (end - 1) // r + 1, dtype)
+        width = end - start
+        if width == len(x) * r:
+            return np.repeat(x, r)
+        counts = np.full(len(x), min(r, width), dtype=np.intp)
+        counts[0] = min(width, r - start % r)
+        counts[-1] = min(width, (end - 1) % r + 1)
+        return np.repeat(x, counts)
 
     def load(self, contig, dtype=None):
         """True values, one per bp, over the whole contig."""
@@ -197,6 +219,7 @@ class Track:
         return f"<hdwig.Track {self.path} {len(self.contigs)} contigs scale={self.scale:g}>"
 
     def close(self):
+        self._cache = None
         self.h5.close()
 
 
@@ -241,6 +264,7 @@ def write(
     stream those pairs; without it they are materialized so it can be measured.
     An overstated `vmax` only costs headroom, an understated one raises.
     """
+    resolution = _positive_resolution(resolution)
     items = arrays.items() if hasattr(arrays, "items") else arrays
     if vmax is None:
         arrays = dict(items)
@@ -256,7 +280,7 @@ def write(
     with h5py.File(path, "w") as h5:
         h5.attrs["hdwig"] = FORMAT
         h5.attrs["scale"] = scale
-        h5.attrs["resolution"] = int(resolution)
+        h5.attrs["resolution"] = resolution
         h5.attrs["units"] = units
 
         for contig, x in items:
