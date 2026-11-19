@@ -66,6 +66,37 @@ def test_scale_divide_is_exact(tmp_path):
         track.close()
 
 
+@pytest.mark.parametrize("scale", [2.0**k for k in (-40, -15, -2, -1, 1, 2, 9, 15, 40)])
+@pytest.mark.parametrize("dtype", ["float16", "float32", "float64"])
+def test_unscale_matches_divide_for_every_float16(tmp_path, scale, dtype):
+    """The read looks true values up rather than dividing. Every float16 bit
+    pattern -- zeros, subnormals, both infinities, every NaN payload, values the
+    scale overflows or underflows -- must come back bit for bit as the divide
+    gives it."""
+    every = np.arange(2**16, dtype="uint16").view("float16")
+    path = _handmade(tmp_path / "t.hw", {"chr1": every}, hdwig=1, scale=scale)
+    with np.errstate(all="ignore"):
+        want = np.divide(every, scale, dtype=dtype)
+    bits = f"uint{want.itemsize * 8}"
+    with hdwig.open(path) as t:
+        got = t.read("chr1", dtype=dtype)
+        assert got.dtype == want.dtype
+        np.testing.assert_array_equal(got.view(bits), want.view(bits))
+        # a window, and a second read off the cached table
+        np.testing.assert_array_equal(t.read("chr1", 1000, 40000, dtype=dtype).view(bits), want[1000:40000].view(bits))
+        assert t.read("chr1", 5, 5, dtype=dtype).shape == (0,)
+
+
+def test_unscale_returns_a_fresh_writable_array(tmp_path):
+    """Callers modify what they read; that must never reach the lookup table."""
+    hdwig.write(tmp_path / "t.hw", {"chr1": np.array([1.0, 2.0, 3.0], "float32")})
+    with hdwig.open(tmp_path / "t.hw") as t:
+        assert t.scale != 1
+        x = t.read("chr1")
+        x[:] = -1
+        np.testing.assert_array_equal(t.read("chr1"), [1, 2, 3])
+
+
 def test_scale_divide_loses_subnormals(tmp_path):
     """The one place it is not exact, and what to do about it."""
     stored = np.array([1e-4], "float16")
@@ -177,12 +208,65 @@ def test_compression_options(tmp_path, arrays, compression):
         np.testing.assert_allclose(track.read("chr1", dtype="float32"), arrays["chr1"], rtol=1e-3)
 
 
+@pytest.mark.parametrize("vmax", [None, np.float32(2.0**-120)])
+def test_write_with_scale_above_float32_range(tmp_path, vmax):
+    x = np.array([0, 2.0**-120], dtype="float32")
+    path = tmp_path / "tiny.hw"
+    with np.errstate(over="raise", invalid="raise"):
+        hdwig.write(path, {"c": x}, vmax=vmax)
+    with h5py.File(path) as h5:
+        assert h5.attrs["scale"] == 2.0**133
+        np.testing.assert_array_equal(h5["c"][:], [0, 8192])
+
+
 def test_float32_storage(tmp_path, arrays):
     path = tmp_path / "f32.hw"
     hdwig.write(path, arrays, dtype="float32")
     with hdwig.open(path) as track:
         assert track.scale == 1.0 and track.stored_dtype == np.float32
         np.testing.assert_array_equal(track.read("chr1"), arrays["chr1"])
+
+
+def test_write_in_blocks_matches_one_block(tmp_path, arrays, monkeypatch):
+    """Contigs are written a block at a time; where the blocks fall must not show."""
+    arrays["chr1"][[3, 6, 7, 4999]] = [np.nan, np.inf, -np.inf, np.nan]
+    hdwig.write(tmp_path / "whole.hw", arrays)
+    monkeypatch.setattr(hdwig, "BLOCK", 7)
+    hdwig.write(tmp_path / "blocks.hw", arrays)
+    with h5py.File(tmp_path / "whole.hw") as a, h5py.File(tmp_path / "blocks.hw") as b:
+        assert dict(a.attrs) == pytest.approx(dict(b.attrs))
+        for contig in arrays:
+            np.testing.assert_array_equal(a[contig][:].view("uint16"), b[contig][:].view("uint16"))
+            assert a[contig].chunks == b[contig].chunks
+
+
+def test_streaming_reads_each_source_block_once(tmp_path, monkeypatch):
+    values = np.array([2, np.nan, -3, np.inf, 0], dtype="float32")
+    reads = []
+
+    class Source:
+        def __len__(self):
+            return len(values)
+
+        def __getitem__(self, window):
+            reads.append(window)
+            return values[window]
+
+    monkeypatch.setattr(hdwig, "BLOCK", 3)
+    path = tmp_path / "stream.hw"
+    hdwig.write(path, {"c": Source()}, vmax=3)
+    assert reads == [slice(0, 3), slice(3, 6)]
+    with hdwig.open(path) as track:
+        assert track.stats == hdwig.Stats(max=3, sum=-1, nonzero=2, nan=1, inf=1)
+        np.testing.assert_array_equal(track.read("c"), values)
+
+
+def test_streaming_rejects_late_overflow(tmp_path, monkeypatch):
+    monkeypatch.setattr(hdwig, "BLOCK", 2)
+    path = tmp_path / "bad.hw"
+    with pytest.raises(ValueError, match="above what"):
+        hdwig.write(path, {"good": [1], "bad": [0, 1, 1e6]}, vmax=1)
+    assert not path.exists()
 
 
 def test_streaming_write(tmp_path, arrays):
@@ -585,3 +669,20 @@ def test_coarse_merge_and_rewrite_keep_bins(tmp_path):
         np.testing.assert_array_equal(m.bins("c"), [0, 2, 4, 6])
         np.testing.assert_array_equal(w.bins("c"), [0, 1, 2, 3])
         assert m.contigs == w.contigs == {"c": 40}
+
+
+def test_streaming_rejects_repeated_contig_before_writing_it(tmp_path):
+    reads = []
+
+    class Source:
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, window):
+            reads.append(window)
+            return np.ones(3, "float32")[window]
+
+    path = tmp_path / "dup.hw"
+    with pytest.raises(ValueError):
+        hdwig.write(path, [("c", [1, 2, 3]), ("c", Source())], vmax=3)
+    assert reads == [] and not path.exists()
