@@ -17,7 +17,7 @@ import h5py
 import hdf5plugin
 import numpy as np
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 FORMAT = 1  # value of the `hdwig` root attribute
 EXT = ".hw"
