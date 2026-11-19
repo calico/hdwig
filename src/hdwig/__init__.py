@@ -6,8 +6,10 @@ back out, so callers only ever see true values. Reads take and return base
 pairs; a track stored at coarser `resolution` repeats each value over its bp.
 """
 
+import os
 import warnings
 from contextlib import ExitStack
+from functools import cache
 from operator import index
 from typing import NamedTuple
 
@@ -21,7 +23,6 @@ FORMAT = 1  # value of the `hdwig` root attribute
 EXT = ".hw"
 CHUNK = 2**16
 BLOCK = 2**22  # values handled at a time when writing
-_LOOKUP_MIN = 2**20  # bins needed to amortize building the first table
 HEADROOM = 4
 
 __all__ = ["Track", "Stats", "open", "write", "merge", "scale_for", "EXT", "FORMAT", "STATS"]
@@ -76,6 +77,18 @@ def _stats(x):
 ################################################################################
 # scale
 ################################################################################
+@cache
+def _unscaled(scale, dtype):
+    """The true value of every float16 bit pattern. float16 division runs in
+    software; a lookup is several times faster and gives identical bits, but
+    raises none of NumPy's floating-point warnings."""
+    every = np.arange(2**16, dtype="uint16").view("float16")
+    with np.errstate(all="ignore"):
+        table = np.divide(every, scale, dtype=dtype)
+    table.flags.writeable = False
+    return table
+
+
 def scale_for(vmax, headroom=HEADROOM, dtype="float16"):
     """The power-of-two storage factor for data topping out at `vmax`.
 
@@ -129,7 +142,6 @@ class Track:
         self.max = float(attrs["max"]) if "max" in attrs else None
         # bp, rounded up to whole bins
         self.contigs = {name: dset.shape[0] * self.resolution for name, dset in self.h5.items()}
-        self._unscaled = {}  # output dtype -> true value of every float16 bit pattern
         # legacy .w5 records none of this; `measure()` gets it by reading
         self.stats = Stats(
             self.max, float(attrs["sum"]), int(attrs["nonzero"]),
@@ -166,22 +178,9 @@ class Track:
         dtype = self.dtype if dtype is None else np.dtype(dtype)
         if self.scale == 1:
             return x.astype(dtype, copy=self._cache is not None)
-        if x.dtype != np.float16 or (x.size < _LOOKUP_MIN and dtype not in self._unscaled):
+        if x.dtype != np.float16:
             return np.divide(x, self.scale, dtype=dtype)
-        bits = x.view("uint16")
-        errors = np.geterr()
-        if any(mode != "ignore" for mode in errors.values()):
-            # Finite halves divided by a factor in this range can only underflow.
-            # Magnitude codes starting at 0x7c00 represent infinities and NaNs.
-            if (dtype != np.float16 or not 1 <= self.scale <= 65504
-                    or errors["under"] != "ignore"
-                    or (bits & 0x7fff).max(initial=0) >= 0x7c00):
-                return np.divide(x, self.scale, dtype=dtype)
-        if dtype not in self._unscaled:
-            every = np.arange(2**16, dtype="uint16").view("float16")
-            with np.errstate(all="ignore"):  # the table covers values the data may never hold
-                self._unscaled[dtype] = np.divide(every, self.scale, dtype=dtype)
-        return self._unscaled[dtype][bits]
+        return _unscaled(self.scale, dtype)[x.view("uint16")]
 
     def read(self, contig, start=None, end=None, dtype=None):
         """True values, one per bp, over `contig[start:end]`.
@@ -297,35 +296,38 @@ def write(
     opts = _filters(compression, level, shuffle)
     total = Stats()
 
-    with h5py.File(path, "w") as h5:
-        h5.attrs["hdwig"] = FORMAT
-        h5.attrs["scale"] = scale
-        h5.attrs["resolution"] = resolution
-        h5.attrs["units"] = units
+    h5 = h5py.File(path, "w")
+    try:
+        with h5:
+            h5.attrs["hdwig"] = FORMAT
+            h5.attrs["scale"] = scale
+            h5.attrs["resolution"] = resolution
+            h5.attrs["units"] = units
 
-        for contig, x in items:
-            # Link only complete contigs into the file if a later block fails validation.
-            dset = h5.create_dataset(
-                None, shape=(len(x),), dtype=dtype, chunks=(max(1, min(chunk, len(x))),), **opts
-            )
-            stats = measured.get(contig) or Stats()
-            for i, b in _blocks(x):
-                if not measured:
-                    stats += _block_stats(b)
-                if stats.max * scale > ceiling:
-                    raise ValueError(
-                        f"{contig} reaches {stats.max:g}, above what {dtype} holds at "
-                        f"scale {scale:g}. Pass a vmax of at least {stats.max:g}."
-                    )
-                if scale != 1:
-                    b = np.multiply(b, scale, dtype=multiply_dtype)
-                dset[i : i + len(b)] = b.astype(dtype, copy=False)
-            h5[contig] = dset
-            total += stats
+            for contig, x in items:
+                dset = h5.create_dataset(
+                    contig, shape=(len(x),), dtype=dtype, chunks=(max(1, min(chunk, len(x))),), **opts
+                )
+                stats = measured.get(contig, Stats())
+                for i, b in _blocks(x):
+                    if contig not in measured:
+                        stats += _block_stats(b)
+                    if stats.max * scale > ceiling:
+                        raise ValueError(
+                            f"{contig} reaches {stats.max:g}, above what {dtype} holds at "
+                            f"scale {scale:g}. Pass a vmax of at least {stats.max:g}."
+                        )
+                    if scale != 1:
+                        b = np.multiply(b, scale, dtype=multiply_dtype)
+                    dset[i : i + len(b)] = b.astype(dtype, copy=False)
+                total += stats
 
-        # measured, not inferred from the vmax the scale came from
-        for field, value in total._asdict().items():
-            h5.attrs[field] = value
+            # measured, not inferred from the vmax the scale came from
+            for field, value in total._asdict().items():
+                h5.attrs[field] = value
+    except BaseException:
+        os.remove(path)  # a partial file would open as a valid track
+        raise
 
 
 ################################################################################

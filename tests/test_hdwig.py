@@ -54,8 +54,7 @@ def test_scale_divide_is_exact(tmp_path):
         scale = 2.0**exponent
         track = hdwig.open(_handmade(tmp_path / f"s{exponent}.hw", {"c": stored},
                                      hdwig=1, scale=scale))
-        with np.errstate(over="ignore"):  # this check only covers normal results
-            true16, true32 = track.read("c"), track.read("c", dtype="float32")
+        true16, true32 = track.read("c"), track.read("c", dtype="float32")
 
         assert true32.dtype == np.float32 and true16.dtype == np.float16
         np.testing.assert_array_equal(true32 * scale, stored.astype("float32"))
@@ -69,7 +68,7 @@ def test_scale_divide_is_exact(tmp_path):
 
 @pytest.mark.parametrize("scale", [2.0**k for k in (-40, -15, -2, -1, 1, 2, 9, 15, 40)])
 @pytest.mark.parametrize("dtype", ["float16", "float32", "float64"])
-def test_unscale_matches_divide_for_every_float16(tmp_path, scale, dtype, monkeypatch):
+def test_unscale_matches_divide_for_every_float16(tmp_path, scale, dtype):
     """The read looks true values up rather than dividing. Every float16 bit
     pattern -- zeros, subnormals, both infinities, every NaN payload, values the
     scale overflows or underflows -- must come back bit for bit as the divide
@@ -79,8 +78,7 @@ def test_unscale_matches_divide_for_every_float16(tmp_path, scale, dtype, monkey
     with np.errstate(all="ignore"):
         want = np.divide(every, scale, dtype=dtype)
     bits = f"uint{want.itemsize * 8}"
-    monkeypatch.setattr(hdwig, "_LOOKUP_MIN", len(every))
-    with hdwig.open(path) as t, np.errstate(all="ignore"):
+    with hdwig.open(path) as t:
         got = t.read("chr1", dtype=dtype)
         assert got.dtype == want.dtype
         np.testing.assert_array_equal(got.view(bits), want.view(bits))
@@ -89,38 +87,14 @@ def test_unscale_matches_divide_for_every_float16(tmp_path, scale, dtype, monkey
         assert t.read("chr1", 5, 5, dtype=dtype).shape == (0,)
 
 
-def test_unscale_returns_a_fresh_writable_array(tmp_path, monkeypatch):
+def test_unscale_returns_a_fresh_writable_array(tmp_path):
     """Callers modify what they read; that must never reach the lookup table."""
-    monkeypatch.setattr(hdwig, "_LOOKUP_MIN", 3)
     hdwig.write(tmp_path / "t.hw", {"chr1": np.array([1.0, 2.0, 3.0], "float32")})
     with hdwig.open(tmp_path / "t.hw") as t:
         assert t.scale != 1
-        np.testing.assert_array_equal(t.read("chr1", 0, 1), [1])
-        assert not t._unscaled
         x = t.read("chr1")
-        assert x.dtype in t._unscaled
         x[:] = -1
         np.testing.assert_array_equal(t.read("chr1"), [1, 2, 3])
-
-
-@pytest.mark.parametrize("scale,bits,mode,error", [
-    (0.5, 0x7bff, "over", "overflow"),
-    (2.0, 0x0001, "under", "underflow"),
-    (2.0, 0x7c01, "invalid", "invalid"),
-])
-def test_unscale_reports_errors_in_the_window(tmp_path, monkeypatch, scale, bits, mode, error):
-    values = np.array([0x4000, bits], dtype="uint16").view("float16")
-    path = _handmade(tmp_path / "legacy.w5", {"c": values}, w5_scale=scale)
-    monkeypatch.setattr(hdwig, "_LOOKUP_MIN", 2)
-    with hdwig.open(path) as track:
-        with np.errstate(all="ignore"):
-            track.read("c")  # build a table before changing the error policy
-        with np.errstate(**{mode: "raise"}):
-            np.testing.assert_array_equal(track.read("c", 0, 1), [2.0 / scale])
-            with pytest.raises(FloatingPointError, match=error):
-                track.read("c", 1, 2)
-        with np.errstate(**{mode: "warn"}), pytest.warns(RuntimeWarning, match=error):
-            track.read("c")
 
 
 def test_scale_divide_loses_subnormals(tmp_path):
@@ -221,8 +195,7 @@ def test_beyond_float16_warns_and_float32_recovers(tmp_path):
 
     with pytest.warns(UserWarning, match="pass dtype='float32'"):
         track = hdwig.open(path, dtype="float16")
-    with pytest.warns(RuntimeWarning, match="overflow"):
-        assert np.isinf(track.read("c")[2])
+    assert np.isinf(track.read("c")[2])  # which is why the warning is there
     track.close()
 
 
@@ -293,8 +266,7 @@ def test_streaming_rejects_late_overflow(tmp_path, monkeypatch):
     path = tmp_path / "bad.hw"
     with pytest.raises(ValueError, match="above what"):
         hdwig.write(path, {"good": [1], "bad": [0, 1, 1e6]}, vmax=1)
-    with h5py.File(path) as h5:
-        assert list(h5) == ["good"]
+    assert not path.exists()
 
 
 def test_streaming_write(tmp_path, arrays):
@@ -697,3 +669,20 @@ def test_coarse_merge_and_rewrite_keep_bins(tmp_path):
         np.testing.assert_array_equal(m.bins("c"), [0, 2, 4, 6])
         np.testing.assert_array_equal(w.bins("c"), [0, 1, 2, 3])
         assert m.contigs == w.contigs == {"c": 40}
+
+
+def test_streaming_rejects_repeated_contig_before_writing_it(tmp_path):
+    reads = []
+
+    class Source:
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, window):
+            reads.append(window)
+            return np.ones(3, "float32")[window]
+
+    path = tmp_path / "dup.hw"
+    with pytest.raises(ValueError):
+        hdwig.write(path, [("c", [1, 2, 3]), ("c", Source())], vmax=3)
+    assert reads == [] and not path.exists()

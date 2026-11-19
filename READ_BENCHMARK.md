@@ -1,19 +1,35 @@
-# When does a float16 lookup pay off?
+# Does a float16 lookup speed up reads?
 
-Opening a track for 128 bases takes about 1.4 ms with direct division. Checking for exceptional inputs before using a lookup retains most of the speedup on a whole contig.
+Question: should `Track.bins` unscale float16 by looking each bit pattern up in a table, rather than dividing?
 
-| Operation | Direct division | Unconditional lookup | Guarded lookup |
-|---|---:|---:|---:|
-| Open and read 128 bases | 1.40 ms | 3.11 ms | 1.39 ms |
-| Open and read 4,194,304 bases | 47.6 ms | 28.8 ms | 30.1 ms |
-| Read 4,194,304 bases already in RAM | 28.4 ms | 7.76 ms | 8.87 ms |
+Answer: yes. After the first read in a process, the lookup is as fast or faster on every read measured, NaN-bearing or not. The cost is a one-time ~1.7 ms table build per (scale, output dtype).
+
+## Results (ms, median)
+
+| Read | Data | Division | Guarded lookup | Cached lookup |
+|---|---|---:|---:|---:|
+| First open + 128 bp in process | finite | 3.10 | 3.20 | 4.93 |
+| Open + 128 bp | finite | 1.47 | 1.48 | 1.47 |
+| Open + whole contig, float16 | finite | 48.6 | 33.6 | 29.5 |
+| Open + whole contig, float16 | 1% NaN | 49.5 | 50.7 | 27.4 |
+| Open + whole contig, float32 | 1% NaN | 29.8 | 29.8 | 27.4 |
+| In RAM, whole contig, float16 | finite | 27.2 | 9.29 | 7.87 |
+| In RAM, whole contig, float16 | 1% NaN | 27.5 | 28.9 | 7.90 |
+| In RAM, whole contig, float32 | 1% NaN | 10.4 | 10.2 | 8.10 |
+
+Float16 output gains most: float16 division runs in software. Float32 output gains ~20%. The guarded lookup has no speedup on NaN-bearing data, where NaN marks "no data" and is common.
 
 ## Method
 
-Each implementation read the same local zstd-compressed float16 track. Inputs were 4,194,304 exponentially distributed float32 values with mean 3, generated with NumPy seed 441 and the default writer settings. NumPy 2.4.6 used its default error policy. Times are medians of seven batches after warm-up, with 30 short reads, three whole-file reads or five in-memory reads per batch. Each in-memory track had already served one whole-contig read.
+One contig of 4,194,304 exponential float32 values (mean 3, NumPy seed 441), written with default settings (float16, zstd); the NaN track sets every 100th value to NaN. NumPy 2.5.2, default error settings. Each timing is the median of 7 batches after one warm-up (30 short reads, 3 whole-file reads, or 5 in-RAM reads per batch). "First open" is a single timing in a fresh process.
 
 ## Decisions and assumptions
 
-Use direct division for first reads below 1,048,576 bins. The setup cost varies with scale. In an array-only check at 524,288 bins and scale 8192, building and checking the lookup took 3.65 ms versus 3.55 ms for division. The cutoff is a conservative choice for this machine.
+- The lookup raises none of NumPy's floating-point warnings. Values are bit-identical to division; only the warnings differ. `open` already warns when a track's values exceed the output dtype.
+- Tables are cached per process, keyed by (scale, dtype). Scales are powers of two, so a process sees few, and each table is at most 512 KB.
 
-For large finite float16 windows, use the lookup when the scale and error settings permit it. Restricting the lookup to callers who silence every error would give default callers the direct-division timings above. Building a fresh table from only the values present took about 21 ms for 4,194,304 in-memory values in the array-only check.
+## Glossary
+
+- **Division**: `np.divide(stored, scale)` on every read (main).
+- **Guarded lookup**: table lookup only for reads ≥ 2^20 bins, with fallback to division whenever NumPy's error settings could report something for the window (previous branch head).
+- **Cached lookup**: table lookup on every float16 read, table cached per process (this version).
