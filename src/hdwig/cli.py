@@ -54,6 +54,7 @@ def _export(args):
 def _info(args):
     with hdwig.open(args.input) as track:
         bases = sum(track.contigs.values())
+        values = bases // track.resolution
         stats = track.measure() if args.scan else track.stats
 
         print(track.path)
@@ -69,9 +70,9 @@ def _info(args):
             return
 
         print(f"  max         {stats.max:g}")
-        print(f"  mean        {stats.sum / bases:g}")
-        print(f"  nonzero     {100 * stats.nonzero / bases:.2f}%")
-        print(f"  nan         {stats.nan} ({100 * stats.nan / bases:.2f}%)")
+        print(f"  mean        {stats.sum / values:g}")
+        print(f"  nonzero     {100 * stats.nonzero / values:.2f}%")
+        print(f"  nan         {stats.nan} ({100 * stats.nan / values:.2f}%)")
         print(f"  inf         {stats.inf}")
 
         if stats.max >= track.ceiling:

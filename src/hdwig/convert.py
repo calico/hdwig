@@ -122,7 +122,7 @@ def from_track(input, path, **kwargs):
         kwargs.setdefault("vmax", vmax)
         kwargs.setdefault("units", track.units)
         kwargs.setdefault("resolution", track.resolution)
-        hdwig.write(path, ((c, track.read(c)) for c in track.contigs), **kwargs)
+        hdwig.write(path, ((c, track.bins(c)) for c in track.contigs), **kwargs)
 
 
 ################################################################################
@@ -136,9 +136,9 @@ def to_bigwig(path, out, contigs=None):
         contigs = contigs or list(track.contigs)
         bw = pyBigWig.open(str(out), "w")
         try:
-            bw.addHeader([(c, track.contigs[c] * track.resolution) for c in contigs])
+            bw.addHeader([(c, track.contigs[c]) for c in contigs])
             for contig in contigs:
-                starts, ends, values = _runs(track.read(contig))
+                starts, ends, values = _runs(track.bins(contig))
                 keep = _interval(values)
                 if keep.any():
                     bw.addEntries(
@@ -155,7 +155,7 @@ def to_bedgraph(path, out, contigs=None):
     """Write true values to a bedGraph, one line per nonzero constant run."""
     with hdwig.open(path, dtype="float32") as track, open(out, "w") as bg:
         for contig in contigs or track.contigs:
-            starts, ends, values = _runs(track.read(contig))
+            starts, ends, values = _runs(track.bins(contig))
             keep = _interval(values)
             for start, end, value in zip(*[a[keep] for a in (starts, ends, values)]):
                 print(f"{contig}\t{start * track.resolution}\t{end * track.resolution}\t{value:.9g}", file=bg)
