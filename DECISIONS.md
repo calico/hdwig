@@ -1,0 +1,1 @@
+- 2026-11-18 — Use direct division for first reads below 1,048,576 bins and a guarded lookup for larger float16 reads. An ignore-only lookup lost the default-mode speedup, and rebuilding a table from observed values took longer on large finite contigs.
