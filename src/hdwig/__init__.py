@@ -2,18 +2,20 @@
 
 One file per track, one 1-D array per contig, float16 by default. A per-track
 power-of-two `scale` keeps the values inside float16's range; reads divide it
-back out, so callers only ever see true values.
+back out, so callers only ever see true values. Reads take and return base
+pairs; a track stored at coarser `resolution` repeats each value over its bp.
 """
 
 import warnings
 from contextlib import ExitStack
+from operator import index
 from typing import NamedTuple
 
 import h5py
 import hdf5plugin
 import numpy as np
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 FORMAT = 1  # value of the `hdwig` root attribute
 EXT = ".hw"
@@ -83,24 +85,40 @@ def scale_for(vmax, headroom=HEADROOM, dtype="float16"):
 ################################################################################
 # read
 ################################################################################
+def _positive_resolution(value):
+    resolution = index(value)
+    if resolution < 1:
+        raise ValueError(f"resolution must be positive, got {value!r}")
+    return resolution
+
+
 class Track:
     """A coverage track, open for reading.
+
+    `read`, `load`, slicing and `contigs` are in base pairs, whatever the
+    stored `resolution`: each stored value covers `resolution` bp, and reads
+    repeat it over them. `bins` reads the stored values themselves.
 
     Reads return true values in the stored dtype, unless `dtype` asks for
     another. Legacy `.w5` files, which carry `w5_scale` instead of `scale` and
     no `max`, read through the same interface.
     """
 
-    def __init__(self, path, dtype=None):
+    def __init__(self, path, dtype=None, memory=False):
         self.path = str(path)
         self.h5 = h5py.File(self.path, "r")
         attrs = self.h5.attrs
         self.format = int(attrs.get("hdwig", 0))  # 0: legacy .w5
         self.scale = float(attrs.get("scale", attrs.get("w5_scale", 1.0)))
-        self.resolution = int(attrs.get("resolution", 1))
+        try:
+            self.resolution = _positive_resolution(attrs.get("resolution", 1))
+        except (TypeError, ValueError, OverflowError):
+            self.h5.close()
+            raise
         self.units = str(attrs.get("units", ""))
         self.max = float(attrs["max"]) if "max" in attrs else None
-        self.contigs = {name: dset.shape[0] for name, dset in self.h5.items()}
+        # bp, rounded up to whole bins
+        self.contigs = {name: dset.shape[0] * self.resolution for name, dset in self.h5.items()}
         # legacy .w5 records none of this; `measure()` gets it by reading
         self.stats = Stats(
             self.max, float(attrs["sum"]), int(attrs["nonzero"]),
@@ -124,16 +142,40 @@ class Track:
             if dtype is None:
                 self.dtype = np.dtype("float32")
 
-    def read(self, contig, start=None, end=None, dtype=None):
-        """True values over `contig[start:end]`."""
-        x = self.h5[contig][start:end]
+        # stored values, from the file or held in memory for many random reads
+        self._cache = None
+        if memory:
+            self._cache = {name: dset[:] for name, dset in self.h5.items()}
+            self.h5.close()
+
+    def bins(self, contig, start=None, end=None, dtype=None):
+        """True stored values over bins `start:end` of `contig`."""
+        source = self.h5 if self._cache is None else self._cache
+        x = source[contig][start:end]
         dtype = self.dtype if dtype is None else np.dtype(dtype)
         if self.scale == 1:
-            return x.astype(dtype, copy=False)
+            return x.astype(dtype, copy=self._cache is not None)
         return np.divide(x, self.scale, dtype=dtype)
 
+    def read(self, contig, start=None, end=None, dtype=None):
+        """True values, one per bp, over `contig[start:end]`.
+
+        A window outside the contig raises IndexError: past the end there is
+        no data to return, and padding or truncating would hide that.
+        """
+        length = self.contigs[contig]
+        start = 0 if start is None else index(start)
+        end = length if end is None else index(end)
+        if not 0 <= start <= end <= length:
+            raise IndexError(f"{contig}:{start}-{end} is outside {contig}:0-{length}")
+        r = self.resolution
+        if r == 1:
+            return self.bins(contig, start, end, dtype)
+        x = self.bins(contig, start // r, -(-end // r), dtype)
+        return np.repeat(x, r)[start % r : start % r + end - start]
+
     def load(self, contig, dtype=None):
-        """True values over the whole contig."""
+        """True values, one per bp, over the whole contig."""
         return self.read(contig, dtype=dtype)
 
     def measure(self):
@@ -141,7 +183,7 @@ class Track:
         check the ones a file claims."""
         total = Stats()
         for contig in self.contigs:
-            total += _stats(self.read(contig, dtype="float32"))
+            total += _stats(self.bins(contig, dtype="float32"))
         return total
 
     @property
@@ -168,12 +210,14 @@ class Track:
         return f"<hdwig.Track {self.path} {len(self.contigs)} contigs scale={self.scale:g}>"
 
     def close(self):
+        self._cache = None
         self.h5.close()
 
 
-def open(path, dtype=None):
-    """Open a track for reading. Also reads legacy `.w5`."""
-    return Track(path, dtype=dtype)
+def open(path, dtype=None, memory=False):
+    """Open a track for reading. Also reads legacy `.w5`. `memory` loads the
+    stored values into RAM, at the stored resolution, for many random reads."""
+    return Track(path, dtype=dtype, memory=memory)
 
 
 ################################################################################
@@ -211,6 +255,7 @@ def write(
     stream those pairs; without it they are materialized so it can be measured.
     An overstated `vmax` only costs headroom, an understated one raises.
     """
+    resolution = _positive_resolution(resolution)
     items = arrays.items() if hasattr(arrays, "items") else arrays
     if vmax is None:
         arrays = dict(items)
@@ -226,7 +271,7 @@ def write(
     with h5py.File(path, "w") as h5:
         h5.attrs["hdwig"] = FORMAT
         h5.attrs["scale"] = scale
-        h5.attrs["resolution"] = int(resolution)
+        h5.attrs["resolution"] = resolution
         h5.attrs["units"] = units
 
         for contig, x in items:
@@ -266,7 +311,7 @@ STATS = {
 
 
 def merge(path, inputs, stat="sum", **kwargs):
-    """Combine tracks base by base in true values, contigs unioned.
+    """Combine tracks value by value in true values, contigs unioned.
 
     Inputs must agree on resolution and shared contig lengths. Common units
     and resolution are inherited; differing units require an explicit override.
@@ -287,10 +332,10 @@ def merge(path, inputs, stat="sum", **kwargs):
                 raise ValueError("input units differ; pass units explicitly")
             kwargs["units"] = tracks[0].units
 
-        contigs = {}
+        contigs = {}  # bins
         for track in tracks:
             for contig, length in track.contigs.items():
-                if contigs.setdefault(contig, length) != length:
+                if contigs.setdefault(contig, length // resolution) != length // resolution:
                     raise ValueError(f"{contig}: input contig lengths must match")
 
         maxes = np.array([[t.max if t.max is not None else t.measure().max] for t in tracks], "float32")
@@ -301,7 +346,7 @@ def merge(path, inputs, stat="sum", **kwargs):
                 stacked = np.zeros((len(tracks), length), dtype="float32")
                 for i, track in enumerate(tracks):
                     if contig in track.contigs:
-                        stacked[i] = track.read(contig)
+                        stacked[i] = track.bins(contig)
                     else:
                         warnings.warn(f"{track.path} is missing {contig}", stacklevel=2)
                 yield contig, STATS[stat](stacked)

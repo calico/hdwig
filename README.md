@@ -15,12 +15,15 @@ pip install hdwig
 import hdwig
 
 track = hdwig.open("liver.hw")
-track.contigs                        # {'chr1': 248956422, ...}
+track.contigs                        # {'chr1': 248956422, ...} in bp
 track.units, track.resolution, track.max
 track.stats                          # Stats(max, sum, nonzero, nan, inf)
-track["chr1", 1_000_000:1_131_072]   # true values, float16
+track["chr1", 1_000_000:1_131_072]   # true values, one per bp, float16
 track.read("chr1", 0, 1000, dtype="float32")
-track.load("chr1")
+track.load("chr1")                   # whole contig, one value per bp
+track.bins("chr1")                   # stored values, one per `resolution` bp
+
+track = hdwig.open("liver.hw", memory=True)   # hold it in RAM for many random reads
 
 hdwig.write("out.hw", {"chr1": coverage}, units="fragments/base/sample")
 hdwig.merge("sum.hw", ["rep1.hw", "rep2.hw"], stat="sum")
@@ -62,13 +65,27 @@ chunked at 2^16 values, zstd-3 with the byte shuffle filter. Root attributes:
 | `resolution` | bp per value, default 1 |
 | `units` | free text, e.g. `fragments/base/sample` |
 
-Nucleotide resolution is the default. `resolution` records bp per bin; setting
-it does not resample data. Reads and contig lengths use array indices (bins).
-Exports multiply these coordinates by resolution to produce base-pair intervals.
-
 The summary describes the values handed to `write`, before float16 rounded them,
 and is recorded during writing. `hdwig info` reads this metadata without scanning
 the data; `--scan` measures the stored values for comparison.
+
+## Coordinates
+
+Reads are in base pairs, whatever the resolution. `resolution` records bp per
+stored value (default 1); `read`, `load`, slicing and `contigs` all take and
+return bp, and a coarse track repeats each value over the bp it covers. Contig
+lengths are bins × resolution, so a coarse contig ends on a whole bin. `bins`
+reads the stored values in bin coordinates, for code that wants the stored
+resolution; `merge`, `convert` and export work in bins. Writing takes stored
+values, one per bin; setting `resolution` does not resample them.
+
+A window outside `0 ≤ start ≤ end ≤ length` raises `IndexError`. Past the end
+there is no data, and padding or truncating would hide that; clip to
+`track.contigs[contig]` to pad.
+
+`memory=True` loads every contig's stored values into RAM and closes the file;
+reads then index the arrays. Memory is what the file holds uncompressed, at the
+stored resolution.
 
 ## Scale
 

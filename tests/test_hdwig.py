@@ -1,3 +1,5 @@
+import weakref
+
 import h5py
 import numpy as np
 import pytest
@@ -500,3 +502,86 @@ def test_cli_merge_metadata_and_no_compression(tmp_path):
     with hdwig.open(out) as track:
         assert (track.resolution, track.units) == (10, "reads")
         assert track.h5["c"].id.get_create_plist().get_nfilters() == 0
+
+
+################################################################################
+# resolution: reads are in bp
+################################################################################
+@pytest.mark.parametrize("memory", [False, True])
+def test_coarse_reads_are_bp(tmp_path, memory):
+    rng = np.random.default_rng(1)
+    r, values = 20, rng.exponential(5.0, 501).astype("float32")
+    hdwig.write(tmp_path / "r20.hw", {"c": values}, resolution=r)
+    hdwig.write(tmp_path / "r1.hw", {"c": np.repeat(values, r)})
+    with hdwig.open(tmp_path / "r20.hw", memory=memory) as coarse, hdwig.open(tmp_path / "r1.hw") as fine:
+        assert coarse.contigs == fine.contigs == {"c": 501 * r}
+        np.testing.assert_array_equal(coarse.bins("c"), fine.bins("c")[::r])
+        np.testing.assert_array_equal(coarse.load("c"), fine.load("c"))
+        for _ in range(500):
+            start = int(rng.integers(0, 501 * r))
+            end = int(rng.integers(start, min(start + 700, 501 * r) + 1))
+            np.testing.assert_array_equal(coarse.read("c", start, end), fine.read("c", start, end))
+            np.testing.assert_array_equal(coarse["c", start:end], fine["c", start:end])
+
+
+@pytest.mark.parametrize("memory", [False, True])
+@pytest.mark.parametrize("window", [(-1, 10), (0, 41), (30, 20)])
+def test_window_outside_contig_raises(tmp_path, memory, window):
+    hdwig.write(tmp_path / "a.hw", {"c": np.ones(4)}, resolution=10)
+    with hdwig.open(tmp_path / "a.hw", memory=memory) as track:
+        with pytest.raises(IndexError, match="outside c:0-40"):
+            track.read("c", *window)
+
+
+def test_memory_track_reads_after_file_closes(tmp_path, arrays):
+    hdwig.write(tmp_path / "a.hw", arrays)
+    with hdwig.open(tmp_path / "a.hw", memory=True) as track:
+        assert not track.h5.id.valid
+        np.testing.assert_allclose(track["chr1", 10:20], arrays["chr1"][10:20], rtol=1e-3)
+        cached = weakref.ref(track._cache["chr1"])
+    assert cached() is None
+    with pytest.raises((KeyError, ValueError)):
+        track.read("chr1", 0, 1)
+
+
+def test_memory_reads_are_independent(tmp_path):
+    path = tmp_path / "a.hw"
+    hdwig.write(path, {"c": [1, 2]}, dtype="float32")
+    with hdwig.open(path, memory=True) as track:
+        track.bins("c")[0] = 5
+        track["c", 0:1][0] = 6
+        track.load("c")[0] = 7
+        np.testing.assert_array_equal(track.load("c"), [1, 2])
+
+
+def test_unsigned_window_coordinates(tmp_path):
+    path = tmp_path / "a.hw"
+    hdwig.write(path, {"c": np.arange(26)}, resolution=10)
+    with hdwig.open(path) as track:
+        np.testing.assert_array_equal(track["c", np.uint8(249):np.uint8(255)], [24, 25, 25, 25, 25, 25])
+
+
+@pytest.mark.parametrize("resolution", [0, -1])
+def test_invalid_resolution(tmp_path, resolution):
+    path = tmp_path / "a.hw"
+    hdwig.write(path, {"c": [1]})
+    with pytest.raises(ValueError, match="resolution"):
+        hdwig.write(path, {"c": [2]}, resolution=resolution)
+    with hdwig.open(path) as track:
+        np.testing.assert_array_equal(track.load("c"), [1])
+
+    with h5py.File(path, "r+") as h5:
+        h5.attrs["resolution"] = resolution
+    with pytest.raises(ValueError, match="resolution"):
+        hdwig.open(path)
+
+
+def test_coarse_merge_and_rewrite_keep_bins(tmp_path):
+    a, merged, rewritten = (tmp_path / n for n in ("a.hw", "m.hw", "w.hw"))
+    hdwig.write(a, {"c": np.arange(4, dtype="float32")}, resolution=10)
+    hdwig.merge(merged, [a, a])
+    convert.from_track(a, rewritten)
+    with hdwig.open(merged) as m, hdwig.open(rewritten) as w:
+        np.testing.assert_array_equal(m.bins("c"), [0, 2, 4, 6])
+        np.testing.assert_array_equal(w.bins("c"), [0, 1, 2, 3])
+        assert m.contigs == w.contigs == {"c": 40}
