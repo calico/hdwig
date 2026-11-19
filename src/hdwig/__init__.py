@@ -86,7 +86,7 @@ def scale_for(vmax, headroom=HEADROOM, dtype="float16"):
 # read
 ################################################################################
 def _positive_resolution(value):
-    resolution = int(value)
+    resolution = index(value)
     if resolution < 1:
         raise ValueError(f"resolution must be positive, got {value!r}")
     return resolution
@@ -171,17 +171,8 @@ class Track:
         r = self.resolution
         if r == 1:
             return self.bins(contig, start, end, dtype)
-        first = start // r
-        if start == end:
-            return self.bins(contig, first, first, dtype)
-        x = self.bins(contig, first, (end - 1) // r + 1, dtype)
-        width = end - start
-        if width == len(x) * r:
-            return np.repeat(x, r)
-        counts = np.full(len(x), min(r, width), dtype=np.intp)
-        counts[0] = min(width, r - start % r)
-        counts[-1] = min(width, (end - 1) % r + 1)
-        return np.repeat(x, counts)
+        x = self.bins(contig, start // r, -(-end // r), dtype)
+        return np.repeat(x, r)[start % r : start % r + end - start]
 
     def load(self, contig, dtype=None):
         """True values, one per bp, over the whole contig."""

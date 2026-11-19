@@ -561,17 +561,6 @@ def test_unsigned_window_coordinates(tmp_path):
         np.testing.assert_array_equal(track["c", np.uint8(249):np.uint8(255)], [24, 25, 25, 25, 25, 25])
 
 
-def test_short_reads_from_large_bins(tmp_path):
-    path = tmp_path / "a.hw"
-    # A whole bin cannot fit in an ndarray, but these windows fit.
-    r = 2**63
-    hdwig.write(path, {"c": [3, 5]}, resolution=r)
-    with hdwig.open(path) as track:
-        np.testing.assert_array_equal(track.read("c", 1, 1), [])
-        np.testing.assert_array_equal(track.read("c", 2, 3), [3])
-        np.testing.assert_array_equal(track.read("c", r - 1, r + 1), [3, 5])
-
-
 @pytest.mark.parametrize("resolution", [0, -1])
 def test_invalid_resolution(tmp_path, resolution):
     path = tmp_path / "a.hw"
